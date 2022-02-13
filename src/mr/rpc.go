@@ -14,12 +14,37 @@ import "strconv"
 // and reply for an RPC.
 //
 
+//type Base struct {
+//	StatusCode int
+//	StatusMsg string
+//}
+
 type ExampleArgs struct {
 	X int
 }
 
 type ExampleReply struct {
 	Y int
+}
+
+type AssignTaskArgs struct {
+	 WorkerId WorkerId
+}
+
+type AssignTaskReply struct {
+	//Base
+	// lab1假设网络为可信赖
+	TaskInfo
+	NMap int
+	NReduce int
+}
+
+type EndTaskArgs struct {
+	TaskInfo
+}
+
+type EndTaskReply struct {
+	Accepted bool //处理结果是否被master接受
 }
 
 // Add your RPC definitions here.
