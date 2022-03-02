@@ -165,44 +165,36 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.logPrint("Request vote, args=%+v", args)
-	curTerm := rf.currentTerm
-	rf.mu.Unlock()
-	reply.Term = curTerm
+
+	reply.Term = rf.currentTerm
 	// candidate的term小于接收者的当前term，拒绝投票
 	// todo
-	if curTerm > args.Term {
-		rf.mu.Lock()
+	if rf.currentTerm > args.Term {
 		rf.logPrint("Request vote: refuse it because [%v]`s term [%v] is less.", args.CandidateId, args.Term)
-		rf.mu.Unlock()
 		reply.VoteGranted = false
 		return
 	}
 	// candidate的term大于接收者的currentTerm, 需更新currentTerm为candidate的term，状态变更为follower
-	if curTerm < args.Term {
-		rf.mu.Lock()
+	if rf.currentTerm < args.Term {
 		rf.logPrint("Receive appendEntries: term is less than [%v]`s term[%v], so update to follower.", args.CandidateId, args.Term)
 		rf.currentTerm = args.Term
 		rf.state = RaftStateFollower
 		rf.votedFor = -1
-		rf.mu.Unlock()
 	}
 	// 如果 votedFor 为空或者为 candidateId，并且candidate的日志至少和自己一样新，那么就投票
 	// 投票后更新心跳时间 （论文fiture2有一句话提到）
-	rf.mu.Lock()
 	votedFor := rf.votedFor
 	logLen := len(rf.log) - 1
-	rf.mu.Unlock()
 	// todo: 新旧比较补充完整
 	// 1.如果两份日志最后 entry 的 term 号不同，则 term 号大的日志更新
 	// 2.如果两份日志最后 entry 的 term 号相同，则比较长的日志更新
 	if (votedFor == -1 || votedFor == args.CandidateId) && int64(logLen) <= args.LastLogIndex {
-		rf.mu.Lock()
 		rf.logPrint("Receive appendEntries: agree to vote for [%v].", args.CandidateId)
 		rf.votedFor = args.CandidateId
 		rf.lastHeartBeatTime = time.Now()
 		reply.VoteGranted = true
-		rf.mu.Unlock()
 	}
 }
 
@@ -257,35 +249,28 @@ type AppendEntriesReply struct {
 // 用于日志的复制，同时也用做心跳
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.logPrint("Receive appendEntries, args=%+v", args)
-	curTerm := rf.currentTerm
-	rf.mu.Unlock()
-	reply.Term = curTerm
+	reply.Term = rf.currentTerm
 	// leader的term小于接收者的当前term, 返回false
-	if curTerm > args.Term {
-		rf.mu.Lock()
+	if rf.currentTerm > args.Term {
 		rf.logPrint("Receive appendEntries: refuse it because [%v]`s term [%v] is less.", args.LeaderId, args.Term)
-		rf.mu.Unlock()
 		reply.Success = false
 		return
 	}
 	// leader的term大于接收者的currentTerm, 需更新currentTerm为leader的term，状态变更为follower
 	// todo
-	if curTerm < args.Term {
-		rf.mu.Lock()
+	if rf.currentTerm < args.Term {
 		rf.logPrint("Receive appendEntries: term is less than [%v]`s term[%v], so update to follower.", args.LeaderId, args.Term)
 		rf.currentTerm = args.Term
 		rf.state = RaftStateFollower
 		rf.votedFor = -1
-		rf.mu.Unlock()
 	}
 
 	// 本次请求为heartBeat
 	if len(args.Entries) == 0 {
-		rf.mu.Lock()
 		rf.logPrint("Receive appendEntries: get heartBeat from [%v] and accept it.", args.LeaderId)
 		rf.lastHeartBeatTime = time.Now()
-		rf.mu.Unlock()
 	}
 	reply.Success = true
 	// 本次只从处理心跳相关的
@@ -344,167 +329,116 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) mainLoop() {
 	for !rf.killed() {
-		time.Sleep(SleepDuration)
+		time.Sleep(HeartBeatDuration)
 		rf.mu.Lock()
-		curState := rf.state
-		// xx
-		rf.mu.Unlock()
-		switch curState {
-		case RaftStateLeader:
+		if rf.state == RaftStateLeader {
 			rf.doMainLeader()
-		case RaftStateFollower:
-			rf.doMainFollower()
-		case RaftStateCandidate:
-			rf.doMainCandidate()
 		}
+		rf.checkAndStartElection()
+		rf.mu.Unlock()
 	}
 }
 
 func (rf *Raft) doMainLeader() {
-	now := time.Now()
-	rf.mu.Lock()
-	sub := now.Sub(rf.lastHeartBeatTime)
-	rf.mu.Unlock()
-	if sub >= HeartBeatDuration {
-		// 心跳间隔时间到，再次发送心跳
-		rf.mu.Lock() // 结构体（Time.time）赋值必须加锁
-		rf.logPrint("Heartbeat timeout, start to issue heartbeat again.")
-		rf.lastHeartBeatTime = time.Now()
-		rf.mu.Unlock()
+	rf.logPrint("Heartbeat timeout, start to issue heartbeat again.")
 
-		args := AppendEntriesArgs{}
-		rf.mu.Lock()
-		args.Term = rf.currentTerm
-		args.LeaderId = int64(rf.me)
-		rf.mu.Unlock()
-		for peerId, _ := range rf.peers {
-			if peerId == rf.me {
-				continue
-			}
-			//对所有server发送心跳
-			go func(peerId int) {
-				var reply AppendEntriesReply
-				rf.mu.Lock()
-				rf.logPrint("Issue heartbeat to %v.", peerId)
-				rf.mu.Unlock()
-				ok := rf.sendAppendEntries(peerId, &args, &reply)
-				// 不可达
-				if !ok {
-					rf.mu.Lock()
-					rf.logPrint("Issue heartbeat: %v unreachable.", peerId)
-					rf.mu.Unlock()
-					return
-				}
-				// 判断收到的term是否和发送时term一样，不一样说明此次rpc请求已过期，可忽略
-				if args.Term != atomic.LoadInt64(&rf.currentTerm) {
-					rf.logPrint("Issue heartbeat: term has been changed from previous args`s term to [%v], so ignore it.", peerId)
-					return
-				}
-				// leader的term小于收到的的term, 需更新term为收到的term，状态变更为follower
-				if rf.currentTerm < reply.Term {
-					rf.mu.Lock()
-					rf.logPrint("Issue heartbeat: term is less than [%v]`s term[%v], so update to follower.", peerId, reply.Term)
-					rf.currentTerm = reply.Term
-					rf.state = RaftStateFollower
-					rf.lastHeartBeatTime = time.Now() // 虽然不是收到心跳rpc，但也重置定时器
-					rf.votedFor = -1                  //todo: 是否需要更新
-					rf.mu.Unlock()
-				}
-			}(peerId)
+	args := AppendEntriesArgs{}
+	args.Term = rf.currentTerm
+	args.LeaderId = int64(rf.me)
 
+	for peerId, _ := range rf.peers {
+		if peerId == rf.me {
+			rf.lastHeartBeatTime = time.Now()
+			continue
 		}
-	}
-}
-
-func (rf *Raft) doMainFollower() {
-	now := time.Now()
-	rf.mu.Lock()
-	sub := now.Sub(rf.lastHeartBeatTime)
-	timeout := rf.timeOutDuration
-	rf.mu.Unlock()
-	// 选举超时，转变身份开始重新选举（仅做这一步操作，就退出此次滴答循环,进入candidate身份）
-	if sub >= timeout {
-		rf.mu.Lock()
-		rf.logPrint("Election timeout, transfer to candidate for later election.")
-		rf.state = RaftStateCandidate
-		rf.mu.Unlock()
+		// 对所有server发送心跳
+		rf.logPrint("Issue heartbeat to %v.", peerId)
+		go func(peerId int) {
+			var reply AppendEntriesReply
+			ok := rf.sendAppendEntries(peerId, &args, &reply)
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			// 不可达
+			if !ok {
+				rf.logPrint("Issue heartbeat: %v unreachable.", peerId)
+				return
+			}
+			// 判断收到的term是否和发送时term一样，不一样说明此次rpc请求已过期，可忽略
+			//if args.Term != rf.currentTerm {
+			//	rf.logPrint("Issue heartbeat: term has been changed from previous args`s term to [%v], so ignore it.", peerId)
+			//	return
+			//}
+			// leader的term小于收到的的term, 需更新term为收到的term，状态变更为follower
+			if rf.currentTerm < reply.Term {
+				rf.logPrint("Issue heartbeat: term is less than [%v]`s term[%v], so update to follower.", peerId, reply.Term)
+				rf.currentTerm = reply.Term
+				rf.state = RaftStateFollower
+				//rf.lastHeartBeatTime = time.Now() // 虽然不是收到心跳rpc，但也重置定时器
+				rf.votedFor = -1
+			}
+		}(peerId)
 	}
 }
 
 // 两种情况进入选举流程：
 // 1. 由follower->candidate
 // 2. 选票分裂直到超时，需要发起新一轮选举
-func (rf *Raft) doMainCandidate() {
-	now := time.Now()
-	rf.mu.Lock()
-	sub := now.Sub(rf.lastHeartBeatTime)
-	timeout := rf.timeOutDuration
-	rf.mu.Unlock()
-	if sub >= timeout {
+func (rf *Raft) checkAndStartElection() {
+	if time.Now().Sub(rf.lastHeartBeatTime) > rf.timeOutDuration {
 		// 增加term，投票给自己，重置计时器，重置timeout时间
-		rf.mu.Lock()
 		rf.logPrint("Election timeout, start election.")
+		rf.state = RaftStateCandidate
 		rf.currentTerm++
 		rf.votedFor = int64(rf.me)
-		rf.lastHeartBeatTime = time.Now() // attention
 		rf.timeOutDuration = generateTimeout()
-		rf.mu.Unlock()
+
 		// 发送请求投票的RPC
 		args := RequestVoteArgs{}
-		rf.mu.Lock()
 		args.Term = rf.currentTerm
 		args.CandidateId = int64(rf.me)
 		args.LastLogIndex = int64(len(rf.log) - 1)
 		args.LastLogTerm = 0 // lab2A为0即可 todo
-		rf.mu.Unlock()
 
 		var voteCount int64 = 1 // 获得的投票数
 		for peerId, _ := range rf.peers {
 			if peerId == rf.me {
+				rf.lastHeartBeatTime = time.Now()
 				continue
 			}
+			rf.logPrint("Candidate request vote of %v.", peerId)
 			go func(peerId int) {
 				var reply RequestVoteReply
-				rf.mu.Lock()
-				rf.logPrint("Candidate request vote of %v.", peerId)
-				rf.mu.Unlock()
 				ok := rf.sendRequestVote(peerId, &args, &reply)
 				// 不可达
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
 				if !ok {
-					rf.mu.Lock()
 					rf.logPrint("Candidate request votes: %v unreachable.", peerId)
-					rf.mu.Unlock()
 					return
 				}
 				// 回复的term大于当前term，转变为follower，更新term
-				if reply.Term > atomic.LoadInt64(&rf.currentTerm) {
-					rf.mu.Lock()
+				if reply.Term > rf.currentTerm {
 					rf.logPrint("Candidate request votes: term is less than [%v]`s term[%v], so update to follower.", peerId, reply.Term)
 					rf.currentTerm = reply.Term
 					rf.state = RaftStateFollower
 					rf.lastHeartBeatTime = time.Now() // 虽然不是收到心跳rpc，但也重置定时器
 					rf.votedFor = -1
-					rf.mu.Unlock()
 					return
 				}
 				// 赢得选票
-				rf.mu.Lock()
 				majorCount := len(rf.peers)/2 + 1
-				rf.mu.Unlock()
 				if reply.VoteGranted {
-					atomic.AddInt64(&voteCount, 1)
-					if atomic.LoadInt64(&voteCount) >= int64(majorCount) {
+					voteCount++
+					if voteCount >= int64(majorCount) {
 						// 已获得大多数选票，无须其他选票结果了
-						// 当前状态为candidate则需要tranfer为leader ??
-						rf.mu.Lock()
-						// 当前状态不为candidate则是无效投票，不为candidate原因包括
-						// 1.已经获得足够选票成为leader 2. 由于响应高term请求而变成follower
+
+						// 当前状态不为candidate则是无效投票，因为已经获得足够选票成为leader
 						if rf.state == RaftStateCandidate {
 							rf.logPrint("Candidate request votes: received majority. tranfer from candidate to leader.")
 							rf.state = RaftStateLeader
 						}
-						rf.mu.Unlock()
 						//优化 todo: 成为领导人后立刻发送心跳建立权威
+						rf.doMainLeader()
 					}
 				}
 			}(peerId)

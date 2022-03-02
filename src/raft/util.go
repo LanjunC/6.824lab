@@ -21,7 +21,7 @@ var rander = rand.New(rand.NewSource(time.Now().UnixNano()))
 var stateMap map[RaftState]string
 
 const (
-	SleepDuration = 10 * time.Millisecond // mainLoop主循环中每次滴答间隔时间
+	SleepDuration = 10 * time.Millisecond // 废弃 mainLoop主循环中每次滴答间隔时间.
 	HeartBeatDuration =  150 * time.Millisecond // leader心跳间隔时间
 	TimeOutDurationSt = 1200 * time.Millisecond // 选举超时的随机范围的下限
 	TimeOutDurationEd = 1500 * time.Millisecond // 选举超时的随机范围的上限
