@@ -187,8 +187,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = -1
 		rf.mu.Unlock()
 	}
-	// 1. 如果 votedFor 为空或者为 candidateId，并且candidate的日志至少和自己一样新，那么就投票
-	// 2. 若投了票, 且当前状态为follower，将状态变更为candidate
+	// 如果 votedFor 为空或者为 candidateId，并且candidate的日志至少和自己一样新，那么就投票
+	// 投票后更新心跳时间 （论文fiture2有一句话提到）
 	rf.mu.Lock()
 	votedFor := rf.votedFor
 	logLen := len(rf.log) - 1
@@ -200,11 +200,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.mu.Lock()
 		rf.logPrint("Receive appendEntries: agree to vote for [%v].", args.CandidateId)
 		rf.votedFor = args.CandidateId
+		rf.lastHeartBeatTime = time.Now()
 		reply.VoteGranted = true
-		if rf.state == RaftStateFollower {
-			rf.logPrint("Receive appendEntries: transfer to candidate after vote for [%v].", args.CandidateId)
-			rf.state = RaftStateCandidate
-		}
 		rf.mu.Unlock()
 	}
 }
@@ -400,7 +397,7 @@ func (rf *Raft) doMainLeader() {
 				}
 				// 判断收到的term是否和发送时term一样，不一样说明此次rpc请求已过期，可忽略
 				if args.Term != atomic.LoadInt64(&rf.currentTerm) {
-					rf.logPrint("Issue heartbeat: %v unreachable.", peerId)
+					rf.logPrint("Issue heartbeat: term has been changed from previous args`s term to [%v], so ignore it.", peerId)
 					return
 				}
 				// leader的term小于收到的的term, 需更新term为收到的term，状态变更为follower
@@ -500,6 +497,8 @@ func (rf *Raft) doMainCandidate() {
 						// 已获得大多数选票，无须其他选票结果了
 						// 当前状态为candidate则需要tranfer为leader ??
 						rf.mu.Lock()
+						// 当前状态不为candidate则是无效投票，不为candidate原因包括
+						// 1.已经获得足够选票成为leader 2. 由于响应高term请求而变成follower
 						if rf.state == RaftStateCandidate {
 							rf.logPrint("Candidate request votes: received majority. tranfer from candidate to leader.")
 							rf.state = RaftStateLeader
