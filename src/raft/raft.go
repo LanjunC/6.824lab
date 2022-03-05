@@ -433,7 +433,7 @@ func (rf *Raft) checkAndStartElection() {
 		rf.state = RaftStateCandidate
 		rf.currentTerm++
 		rf.votedFor = int64(rf.me)
-		rf.timeOutDuration = generateTimeout()
+		rf.resetTimeout()
 
 		var voteCount int64 = 1 // 获得的投票数
 		var toLeader sync.Once
@@ -587,7 +587,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int64, len(rf.peers))
 	rf.matchIndex = make([]int64, len(rf.peers))
 	rf.lastHeartBeatTime = time.Now()
-	rf.timeOutDuration = generateTimeout()
+	rf.resetTimeout()
 	rf.applyCh = applyCh
 	rf.applyCond = sync.NewCond(&rf.mu)
 

@@ -17,7 +17,7 @@ const (
 	RaftStateCandidate
 )
 
-var rander = rand.New(rand.NewSource(time.Now().UnixNano()))
+//var rander = rand.New(rand.NewSource(time.Now().UnixNano())) 会导致并发不安全
 var stateMap map[RaftState]string
 
 const (
@@ -42,10 +42,10 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-func generateTimeout() time.Duration {
+func (rf *Raft)resetTimeout()  {
 	st := int64(TimeOutDurationSt)
 	ed := int64(TimeOutDurationEd)
-	return time.Duration(st + rander.Int63n(ed-st))
+	rf.timeOutDuration = time.Duration(st + rand.Int63n(ed-st))
 }
 
 func max(i, j int64) int64 {
