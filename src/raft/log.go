@@ -7,11 +7,9 @@ type Log struct {
 }
 
 func (rf *Raft) getLastLog() Log {
-	return rf.log[len(rf.log)-1]
+	return rf.logs[len(rf.logs)-1]
 }
 
-func (rf *Raft) appendLog(log ...Log) {
-	for _, l := range log {
-		rf.log = append(rf.log, l)
-	}
+func (rf *Raft) appendLog(logs ...Log) {
+	rf.logs = append(rf.logs, logs...)
 }
