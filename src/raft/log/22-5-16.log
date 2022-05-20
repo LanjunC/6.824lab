@@ -1,0 +1,77 @@
+// all passed后测试
+=== RUN   TestInitialElection2A
+Test (2A): initial election ...
+  ... Passed --   3.6  3   50   13660    0
+--- PASS: TestInitialElection2A (3.55s)
+=== RUN   TestReElection2A
+Test (2A): election after network failure ...
+  ... Passed --   7.8  3  164   33816    0
+--- PASS: TestReElection2A (7.80s)
+=== RUN   TestBasicAgree2B
+Test (2B): basic agreement ...
+  ... Passed --   1.3  3   16    4374    3
+--- PASS: TestBasicAgree2B (1.33s)
+=== RUN   TestRPCBytes2B
+Test (2B): RPC byte count ...
+  ... Passed --   3.6  3   54  114834   11
+--- PASS: TestRPCBytes2B (3.60s)
+=== RUN   TestFailAgree2B
+Test (2B): agreement despite follower disconnection ...
+  ... Passed --   6.2  3  102   27219    8
+--- PASS: TestFailAgree2B (6.20s)
+=== RUN   TestFailNoAgree2B
+Test (2B): no agreement if too many followers disconnect ...
+  ... Passed --   4.9  5  172   38496    4
+--- PASS: TestFailNoAgree2B (4.89s)
+=== RUN   TestConcurrentStarts2B
+Test (2B): concurrent Start()s ...
+  ... Passed --   1.1  3   20    5798    6
+--- PASS: TestConcurrentStarts2B (1.12s)
+=== RUN   TestRejoin2B
+Test (2B): rejoin of partitioned leader ...
+  ... Passed --   5.4  3  140   32069    4
+--- PASS: TestRejoin2B (5.44s)
+=== RUN   TestBackup2B
+Test (2B): leader backs up quickly over incorrect follower logs ...
+  ... Passed --  18.6  5 2000 1665988  102
+--- PASS: TestBackup2B (18.59s)
+
+=== RUN   TestCount2B
+Test (2B): RPC counts aren't too high ...
+  ... Passed --   2.7  3   58   18868   12
+--- PASS: TestCount2B (2.68s)
+=== RUN   TestPersist12C
+Test (2C): basic persistence ...
+  ... Passed --   7.5  3  120   27576    6
+--- PASS: TestPersist12C (7.51s)
+=== RUN   TestPersist22C
+Test (2C): more persistence ...
+  ... Passed --  19.8  5  928  207468   16
+--- PASS: TestPersist22C (19.75s)
+=== RUN   TestPersist32C
+Test (2C): partitioned leader and one follower crash, leader restarts ...
+  ... Passed --   3.2  3   38    9471    4
+--- PASS: TestPersist32C (3.18s)
+=== RUN   TestFigure82C
+Test (2C): Figure 8 ...
+  ... Passed --  39.1  5  696  149772   29
+--- PASS: TestFigure82C (39.06s)
+=== RUN   TestUnreliableAgree2C
+Test (2C): unreliable agreement ...
+  ... Passed --   2.7  5 1056  375440  246
+--- PASS: TestUnreliableAgree2C (2.73s)
+=== RUN   TestFigure8Unreliable2C
+Test (2C): Figure 8 (unreliable) ...
+  ... Passed --  40.2  5 11020 57606196   44
+--- PASS: TestFigure8Unreliable2C (40.16s)
+=== RUN   TestReliableChurn2C
+Test (2C): churn ...
+  ... Passed --  16.4  5 4184 14044107  794
+--- PASS: TestReliableChurn2C (16.39s)
+=== RUN   TestUnreliableChurn2C
+Test (2C): unreliable churn ...
+  ... Passed --  16.7  5 2428 2580968  480
+--- PASS: TestUnreliableChurn2C (16.70s)
+PASS
+
+Process finished with the exit code 0
