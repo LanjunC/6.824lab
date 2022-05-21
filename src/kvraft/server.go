@@ -1,49 +1,160 @@
 package kvraft
 
 import (
-	"../labgob"
-	"../labrpc"
-	"log"
-	"../raft"
-	"sync"
-	"sync/atomic"
+	"LanjunC/mit6.824/labgob"
+	"LanjunC/mit6.824/labrpc"
+	"LanjunC/mit6.824/raft"
+	"fmt"
+	"github.com/sasha-s/go-deadlock"
+	"time"
 )
 
-const Debug = 0
+const Debug = 1
 
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug > 0 {
-		log.Printf(format, a...)
+func (kv *KVServer) DPrint(format string, a ...interface{}) (n int, err error) {
+	if Debug <= 0 {
+		return
 	}
+	s := fmt.Sprintf(format, a...)
+	fmt.Println(fmt.Sprintf("[%v] | %s", kv.me, s))
 	return
 }
 
+//type Op struct {
+//	// Your definitions here.
+//	// Field names must start with capital letters,
+//	// otherwise RPC will break.
+//}
 
-type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+type serverContext struct {
+	req    *OpReq
+	respCh chan *OpResp
+	term   int64
+	index  int64
 }
 
 type KVServer struct {
-	mu      sync.Mutex
+	mu      deadlock.Mutex
 	me      int
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
-	dead    int32 // set by Kill()
-
+	//dead    int32 // set by Kill()
+	closeCh      chan struct{}
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	store         map[string]string
+	applyIndex    int64
+	idx2Context   map[int]*serverContext // log index -> context
+	id2LatestResp map[int64]OpResp       // clientId -> latest resp
 }
 
+//func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
+//	// Your code here.
+//}
+//
+//func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+//	// Your code here.
+//}
 
-func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+func (kv *KVServer) Request(req *OpReq, resp *OpResp) {
+	//if kv.killed() {
+	//	*resp = OpResp{
+	//		Type:     req.Type,
+	//		ClientID: req.ClientID,
+	//		SeqID:    req.SeqID,
+	//		Err:      ErrClosed,
+	//		Value:    "",
+	//	}
+	//	kv.DPrint("Request: ErrClosed.")
+	//	return
+	//}
+	kv.mu.Lock()
+	//defer kv.mu.Unlock() // 大锁会导致the four-way deadlock, 因此start前必须释放锁
+	kv.DPrint("Request: get req=%+v", req)
+	if kv.preProcess(req, resp) {
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+	index, term, isLeader := kv.rf.Start(*req)
+	if !isLeader {
+		*resp = OpResp{
+			Type:     req.Type,
+			ClientID: req.ClientID,
+			SeqID:    req.SeqID,
+			Err:      ErrWrongLeader,
+			Value:    "",
+		}
+		kv.DPrint("Request: ErrWrongLeader.")
+		return
+	}
+	// 再次preProcess， 因为前面释放锁了
+	kv.mu.Lock()
+	if kv.preProcess(req, resp) {
+		kv.mu.Unlock()
+		return
+	}
+	respCh := make(chan *OpResp)
+	serverCtx := &serverContext{
+		req:    req,
+		respCh: respCh,
+		term:   int64(term),
+		index:  int64(index),
+	}
+	// avoid [bad case]: Re-appearing indices
+	if v, ok := kv.idx2Context[index]; ok {
+		kv.DPrint("find re-appearing indices, try to fix it. Index=%v, old context=%+v", index, *v)
+		// find Re-appearing indices, r
+		v.respCh <- &OpResp{
+			Type:     v.req.Type,
+			Value:    "",
+			Err:      ErrReAppearingIndices,
+			ClientID: v.req.ClientID,
+			SeqID:    v.req.SeqID,
+		}
+	}
+	kv.DPrint("Request:login watcher, index=%v, serverCtx=%+v", index, *serverCtx)
+	kv.idx2Context[index] = serverCtx
+	kv.mu.Unlock()
+	*resp = *<-respCh
+	// [bad case]Don`t place unlock here(must before respCh channel), or onApply can`t get lock!
+	// can find the holding-lock timeout by go-deadlock
+	//kv.mu.Unlock()
+	return
 }
 
-func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+// check是否是已经被处理的请求
+// true则直接返回上一次的处理结果
+func (kv *KVServer) preProcess(req *OpReq, resp *OpResp) bool {
+	if kv.killed() {
+		*resp = OpResp{
+			Type:     req.Type,
+			ClientID: req.ClientID,
+			SeqID:    req.SeqID,
+			Err:      ErrClosed,
+			Value:    "",
+		}
+		kv.DPrint("preProcess: ErrClosed.")
+		return true
+	}
+	latestResp, exist := kv.id2LatestResp[req.ClientID]
+	if exist {
+		if latestResp.ClientID != req.ClientID {
+			panic(fmt.Sprintf("invalid clientID: latestResp.ClientID=%v != req.ClientID=%v",
+				latestResp.ClientID, req.ClientID))
+		}
+		if latestResp.SeqID > req.SeqID {
+			panic(fmt.Sprintf("latestResp.SeqID=%v > req.SeqID=%v", latestResp.SeqID, req.SeqID))
+		}
+		if latestResp.SeqID == req.SeqID {
+			*resp = latestResp
+			kv.DPrint("preProcess: latestResp.SeqID == req.SeqID=%v", req.SeqID)
+			return true
+		}
+	}
+	return false
+
 }
 
 //
@@ -57,14 +168,132 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // to suppress debug output from a Kill()ed instance.
 //
 func (kv *KVServer) Kill() {
-	atomic.StoreInt32(&kv.dead, 1)
-	kv.rf.Kill()
 	// Your code here, if desired.
+	close(kv.closeCh)
 }
 
 func (kv *KVServer) killed() bool {
-	z := atomic.LoadInt32(&kv.dead)
-	return z == 1
+	select {
+	case _, ok := <-kv.closeCh:
+		return !ok
+	default:
+		return false
+	}
+}
+
+func (kv *KVServer) eventLoop() {
+	for {
+		select {
+		case <-kv.closeCh:
+			kv.onClose()
+			return
+		case apply := <-kv.applyCh:
+			kv.onApply(apply)
+		}
+	}
+}
+
+func (kv *KVServer) onClose() {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	for index, ctx := range kv.idx2Context {
+		ctx.respCh <- &OpResp{
+			Type:     ctx.req.Type,
+			ClientID: ctx.req.ClientID,
+			SeqID:    ctx.req.SeqID,
+			Err:      ErrClosed,
+			Value:    "",
+		}
+		kv.DPrint("delete watcher, index=%v", index)
+		delete(kv.idx2Context, index)
+	}
+}
+
+func (kv *KVServer) onApply(applyMsg raft.ApplyMsg) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if applyMsg.CommandValid {
+		kv.DPrint("onApply: has agreement on applyMsg=%+v", applyMsg)
+		if int64(applyMsg.CommandIndex) <= kv.applyIndex {
+			panic(fmt.Sprintf("applyMsg.CommandIndex=%v <= kv.applyIndex=%v", applyMsg.CommandIndex, kv.applyIndex))
+		}
+		req, ok := applyMsg.Command.(OpReq)
+		if !ok {
+			panic("command mismatches OpReq type")
+		}
+		ctx, existCtx := kv.idx2Context[applyMsg.CommandIndex]
+		if existCtx {
+			kv.DPrint("onApply: exists context=%+v", ctx)
+			// same index && different term, leader has changed after crash
+			if ctx.term != applyMsg.CommandTerm {
+				ctx.respCh <- &OpResp{
+					Type:     ctx.req.Type,
+					ClientID: ctx.req.ClientID,
+					SeqID:    ctx.req.SeqID,
+					Err:      ErrWrongLeader,
+					Value:    "",
+				}
+				kv.DPrint("delete watcher^^, index=%v", applyMsg.CommandIndex)
+				delete(kv.idx2Context, applyMsg.CommandIndex)
+				// continue with id2LatestResp
+				existCtx = false
+				ctx = nil
+			}
+		} else {
+			// apply on follower
+			kv.DPrint("onApply: exists no context with index=%v", applyMsg.CommandIndex)
+		}
+		latestResp, ok := kv.id2LatestResp[req.ClientID]
+		if ok {
+			kv.DPrint("onApply: exists latestResp=%+v", latestResp)
+			if latestResp.ClientID != req.ClientID {
+				panic(fmt.Sprintf("invalid clientID: latestResp.ClientID=%v != req.ClientID=%v",
+					latestResp.ClientID, req.ClientID))
+			}
+			if latestResp.SeqID > req.SeqID {
+				panic(fmt.Sprintf("latestResp.SeqID=%v > req.SeqID=%v", latestResp.SeqID, req.SeqID))
+			}
+			if latestResp.SeqID == req.SeqID {
+				if existCtx {
+					ctx.respCh <- &latestResp
+					kv.DPrint("delete watcher**, index=%v", applyMsg.CommandIndex)
+					delete(kv.idx2Context, applyMsg.CommandIndex)
+				}
+				return
+			}
+		}
+		resp := &OpResp{
+			Type:     req.Type,
+			ClientID: req.ClientID,
+			SeqID:    req.SeqID,
+			Err:      OK,
+			Value:    "",
+		}
+		switch resp.Type {
+		case OpTypeGet:
+			v, exist := kv.store[req.Key]
+			if exist {
+				resp.Value = v
+			} else {
+				resp.Err = ErrNoKey
+			}
+		case OpTypePut:
+			kv.store[req.Key] = req.Value
+		case OpTypeAppend:
+			kv.store[req.Key] = kv.store[req.Key] + req.Value
+		}
+
+		kv.DPrint("onApply: final resp=%+v, update latest resp", resp)
+		kv.id2LatestResp[req.ClientID] = *resp
+		kv.applyIndex = int64(applyMsg.CommandIndex)
+		if existCtx {
+			ctx.respCh <- resp
+			kv.DPrint("delete watcher$$, index=%v", applyMsg.CommandIndex)
+			delete(kv.idx2Context, applyMsg.CommandIndex)
+		}
+	} else {
+		// snapshot
+	}
 }
 
 //
@@ -84,18 +313,29 @@ func (kv *KVServer) killed() bool {
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Op{})
-
-	kv := new(KVServer)
-	kv.me = me
-	kv.maxraftstate = maxraftstate
+	labgob.Register(OpReq{}) // todo
 
 	// You may need initialization code here.
+	applyCh := make(chan raft.ApplyMsg)
 
-	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	// DEBUG
+	deadlock.Opts.DeadlockTimeout = time.Second // 获取锁超时控制
+	//deadlock.Opts.Disable = true
+
+	kv := &KVServer{
+		mu:            deadlock.Mutex{},
+		me:            me,
+		rf:            raft.Make(servers, me, persister, applyCh),
+		applyCh:       applyCh,
+		closeCh:       make(chan struct{}),
+		maxraftstate:  maxraftstate,
+		store:         make(map[string]string),
+		applyIndex:    0,
+		idx2Context:   make(map[int]*serverContext),
+		id2LatestResp: make(map[int64]OpResp),
+	}
 
 	// You may need initialization code here.
-
+	go kv.eventLoop()
 	return kv
 }

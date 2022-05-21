@@ -1,7 +1,7 @@
 package kvraft
 
-import "../porcupine"
-import "../models"
+import "LanjunC/mit6.824/porcupine"
+import "LanjunC/mit6.824/models"
 import "testing"
 import "strconv"
 import "time"

@@ -44,6 +44,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int64
 }
 
 //
@@ -416,6 +417,7 @@ func (rf *Raft) handleRaftReady() {
 			Command:      rf.state.logs.entries[i].Command,
 			CommandValid: true,
 			CommandIndex: int(i),
+			CommandTerm:  rf.state.currentTerm,
 		}
 		rf.state.logPrint("handleRaftReady apply log: apply command, index=%v, term=%v, command=%v",
 			i, rf.state.logs.entries[i].Term, rf.state.logs.entries[i].Command)
