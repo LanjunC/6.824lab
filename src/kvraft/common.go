@@ -1,11 +1,12 @@
 package kvraft
 
 const (
-	OK                    = "OK"
-	ErrNoKey              = "ErrNoKey"
-	ErrWrongLeader        = "ErrWrongLeader"
-	ErrClosed             = "ErrClosed"
-	ErrReAppearingIndices = "ErrReAppearingIndices"
+	OK             = "OK"
+	ErrNoKey       = "ErrNoKey"
+	ErrWrongLeader = "ErrWrongLeader"
+	ErrClosed      = "ErrClosed"
+	//ErrReAppearingIndices = "ErrReAppearingIndices"
+	ErrTimeout = "ErrTimeout"
 )
 
 type Err string

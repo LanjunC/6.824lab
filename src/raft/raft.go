@@ -84,6 +84,19 @@ type Raft struct {
 	applyCh chan ApplyMsg
 	//applyCond *sync.Cond
 	closeCh chan struct{}
+
+	// for snapshot
+	maxraftstate int64
+	getSnapCh    chan GetSnapReq
+}
+
+type GetSnapReq struct {
+	RespCh chan GetSnapResp
+}
+
+type GetSnapResp struct {
+	Index int64
+	Data  []byte
 }
 
 type getStateReq struct {
@@ -117,15 +130,11 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
-func (rf *Raft) persist() {
+func (rf *Raft) persistState(persistState *persistState) {
 	// Your code here (2C).
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	e.Encode(rf.state.currentTerm)
-	e.Encode(rf.state.votedFor)
-	e.Encode(rf.state.logs.entries)
-	// todo: 相比paper可新增如下字段方便快速恢复
-	//e.Encode(rf.state.logs.commitIndex)
+	e.Encode(persistState)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -133,24 +142,41 @@ func (rf *Raft) persist() {
 //
 // restore previously persisted state.
 //
-func (rf *Raft) readPersist(data []byte) {
+func (rf *Raft) readPersistState(data []byte) *persistState {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
-		return
+		return nil
 	}
 	// Your code here (2C).
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	var currentTerm int64
-	var votedFor int64
-	var entries []Entry
-	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&entries) != nil {
+	var persistState *persistState
+	if d.Decode(&persistState) != nil {
 		log.Fatal("read persist failed")
-	} else {
-		rf.state.currentTerm = currentTerm
-		rf.state.votedFor = votedFor
-		rf.state.logs.entries = entries
-		rf.state.logPrint("Read persist success.")
 	}
+	return persistState
+}
+
+func (rf *Raft) persistStateAndSnap(persistState *persistState, snap *SnapShot) {
+	wState, wSnap := new(bytes.Buffer), new(bytes.Buffer)
+	eState, eSnap := labgob.NewEncoder(wState), labgob.NewEncoder(wSnap)
+	eState.Encode(persistState)
+	eSnap.Encode(snap)
+	dataState := wState.Bytes()
+	dataSnap := wSnap.Bytes()
+	rf.persister.SaveStateAndSnapshot(dataState, dataSnap)
+}
+
+func (rf *Raft) readPersistSnap(data []byte) *SnapShot {
+	if data == nil || len(data) < 1 {
+		return nil
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var snap *SnapShot
+	if d.Decode(&snap) != nil {
+		log.Fatal("read persist failed")
+	}
+	return snap
 }
 
 type VoidArgs struct{}
@@ -354,7 +380,7 @@ func (rf *Raft) eventLoop() {
 					if rf.state.stateType != StateLeader {
 						v.startRespCh <- startResp{isLeader: false}
 					} else {
-						index, term := rf.state.getLastLog().Index+1, rf.state.currentTerm
+						index, term := rf.state.logs.getLastIndex()+1, rf.state.currentTerm
 						rf.state.logPrint("start working %+v", v.command)
 						toPropose := Message{
 							MsgType: MsgPropose,
@@ -397,30 +423,90 @@ func (rf *Raft) onTick() {
 	}
 }
 func (rf *Raft) handleRaftReady() {
-	// raft state 发生了变化，persist
-	rf.persist()
+	// persist
+	pState := &persistState{
+		CurrentTerm: rf.state.currentTerm,
+		VotedFor:    rf.state.votedFor,
+		Entries:     rf.state.logs.entries,
+	}
+	pendingSnapShot := rf.state.logs.pendingSnapShot
+	if pendingSnapShot != nil {
+		rf.persistStateAndSnap(pState, pendingSnapShot)
+		rf.applyCh <- ApplyMsg{
+			CommandValid: false,
+			Command:      pendingSnapShot.SnapData,
+			CommandIndex: int(pendingSnapShot.Index),
+			CommandTerm:  pendingSnapShot.Term,
+		}
+		if rf.state.logs.lastApplied > pendingSnapShot.Index {
+			panic("unexpected, lastApplied can not go back")
+		}
+		rf.state.logs.lastApplied = pendingSnapShot.Index
+		rf.state.logs.pendingSnapShot = nil
+	} else {
+		rf.persistState(pState)
+	}
 
+	// 检测，若日志大小达到阈值，获取snapshot，压缩日志
+	if rf.maxraftstate > 0 && int64(rf.persister.RaftStateSize()) >= rf.maxraftstate {
+		getSnapRespCh := make(chan GetSnapResp)
+		getSnapReq := GetSnapReq{RespCh: getSnapRespCh}
+		rf.getSnapCh <- getSnapReq
+		resp := <-getSnapRespCh
+		appliedIndex, data := resp.Index, resp.Data
+		if appliedIndex != rf.state.logs.lastApplied {
+			panic(fmt.Sprintf("got server`s snapshot, server.appliedIndex=%v != raftState.appliedIndex=%v",
+				appliedIndex, rf.state.logs.lastApplied))
+		}
+		term, err := rf.state.logs.getTerm(appliedIndex)
+		if err != nil {
+			panic(fmt.Sprintf("can not get term, index=%v, err=%v", appliedIndex, err))
+		}
+		rf.state.logs.compactLog(appliedIndex)
+		snap := &SnapShot{
+			Index:    appliedIndex,
+			Term:     term,
+			SnapData: data,
+		}
+		pState = &persistState{
+			CurrentTerm: rf.state.currentTerm,
+			VotedFor:    rf.state.votedFor,
+			Entries:     rf.state.logs.entries,
+		}
+		rf.persistStateAndSnap(pState, snap)
+	}
+	var snap *SnapShot
 	for i, _ := range rf.state.msgs {
 		//msg := &rf.state.msgs[i]
 		// 直接使用&rf.state.msgs[i]的话会踩到切片的坑：
 		// 浅拷贝完后，rf.state.msgs = rf.state.msgs[:0]切片大小清零，但底层数组未变
 		// 并发调rpc时msgs可能会append新的msg进来脏掉还未发送的msg
 		msg := deepCopyMsg(&rf.state.msgs[i])
-
+		if msg.MsgType == MsgSnapShot {
+			// lazy load
+			if snap == nil {
+				snap = rf.readPersistSnap(rf.persister.ReadSnapshot())
+			}
+			msg.SnapShot = snap
+		}
 		go rf.sendMessage(int(msg.To), msg, &VoidArgs{})
 	}
 	rf.state.msgs = rf.state.msgs[:0]
 
 	// apply日志
 	for i := rf.state.logs.lastApplied + 1; i <= rf.state.logs.commitIndex; i++ {
+		entry, err := rf.state.logs.getEntry(i)
+		if err != nil {
+			panic("unexpected")
+		}
 		applyMsg := ApplyMsg{
-			Command:      rf.state.logs.entries[i].Command,
+			Command:      entry.Command,
 			CommandValid: true,
 			CommandIndex: int(i),
 			CommandTerm:  rf.state.currentTerm,
 		}
 		rf.state.logPrint("handleRaftReady apply log: apply command, index=%v, term=%v, command=%v",
-			i, rf.state.logs.entries[i].Term, rf.state.logs.entries[i].Command)
+			i, entry.Term, entry.Command)
 		rf.applyCh <- applyMsg
 	}
 	rf.state.logs.lastApplied = rf.state.logs.commitIndex
@@ -443,22 +529,45 @@ func deepCopyMsg(src *Message) *Message {
 // for any long-running work.
 //
 func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
+	persister *Persister, applyCh chan ApplyMsg, snapParam ...interface{}) *Raft {
 	// Your initialization code here (2A, 2B, 2C).
+	var maxraftstate int64 = -1
+	var getSnap chan GetSnapReq
+	if len(snapParam) == 2 {
+		maxraftstate = snapParam[0].(int64)
+		getSnap = snapParam[1].(chan GetSnapReq)
+	}
+	if maxraftstate > 0 && getSnap == nil || maxraftstate < 0 && getSnap != nil {
+		panic("maxraftstate > 0 && getSnap == nil || maxraftstate < 0 && getSnap != nil")
+	}
 	rf := &Raft{
-		peers:     peers,
-		persister: persister,
-		me:        me,
-		dead:      0,
-		state:     newRaftState(me, len(peers), StateFollower),
-		ticker:    nil,
-		msgCh:     make(chan interface{}, 4096),
-		applyCh:   applyCh,
-		closeCh:   make(chan struct{}),
+		peers:        peers,
+		persister:    persister,
+		me:           me,
+		dead:         0,
+		state:        nil, // set later
+		ticker:       nil,
+		msgCh:        make(chan interface{}, 4096),
+		applyCh:      applyCh,
+		closeCh:      make(chan struct{}),
+		maxraftstate: maxraftstate,
+		getSnapCh:    getSnap,
 	}
 
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	persistState, snap := rf.readPersistState(persister.ReadRaftState()), rf.readPersistSnap(persister.ReadSnapshot())
+	fmt.Printf("Make raft DEBUG:persistState=%+v, snap=%+v\n", persistState, snap)
+	// if it has snapshot
+	if snap != nil {
+		msg := ApplyMsg{
+			CommandValid: false,
+			Command:      snap.SnapData,
+			CommandIndex: int(snap.Index),
+			CommandTerm:  snap.Term,
+		}
+		rf.applyCh <- msg
+	}
+	rf.state = newRaftState(me, len(peers), StateFollower, persistState, snap)
 
 	rf.state.logPrint("Make Done.")
 

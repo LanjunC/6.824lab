@@ -4,6 +4,7 @@ import (
 	"LanjunC/mit6.824/labgob"
 	"LanjunC/mit6.824/labrpc"
 	"LanjunC/mit6.824/raft"
+	"bytes"
 	"fmt"
 	"github.com/sasha-s/go-deadlock"
 	"time"
@@ -40,7 +41,8 @@ type KVServer struct {
 	applyCh chan raft.ApplyMsg
 	//dead    int32 // set by Kill()
 	closeCh      chan struct{}
-	maxraftstate int // snapshot if log grows this big
+	maxraftstate int64 // snapshot if log grows this big
+	getSnapCh    chan raft.GetSnapReq
 
 	// Your definitions here.
 	store         map[string]string
@@ -109,7 +111,7 @@ func (kv *KVServer) Request(req *OpReq, resp *OpResp) {
 		v.respCh <- &OpResp{
 			Type:     v.req.Type,
 			Value:    "",
-			Err:      ErrReAppearingIndices,
+			Err:      ErrTimeout,
 			ClientID: v.req.ClientID,
 			SeqID:    v.req.SeqID,
 		}
@@ -189,6 +191,9 @@ func (kv *KVServer) eventLoop() {
 			return
 		case apply := <-kv.applyCh:
 			kv.onApply(apply)
+		case getSnapReq := <-kv.getSnapCh:
+			respCh := getSnapReq.RespCh
+			respCh <- *kv.onGetSnap()
 		}
 	}
 }
@@ -216,6 +221,7 @@ func (kv *KVServer) onApply(applyMsg raft.ApplyMsg) {
 		kv.DPrint("onApply: has agreement on applyMsg=%+v", applyMsg)
 		if int64(applyMsg.CommandIndex) <= kv.applyIndex {
 			panic(fmt.Sprintf("applyMsg.CommandIndex=%v <= kv.applyIndex=%v", applyMsg.CommandIndex, kv.applyIndex))
+			// todo 崩溃的raft回来后appliedIndex和commitIdex都为0... check??
 		}
 		req, ok := applyMsg.Command.(OpReq)
 		if !ok {
@@ -292,7 +298,56 @@ func (kv *KVServer) onApply(applyMsg raft.ApplyMsg) {
 			delete(kv.idx2Context, applyMsg.CommandIndex)
 		}
 	} else {
-		// snapshot
+		// applyMsg about snapshot
+		kv.DPrint("receive applyMsg about snapshot, applyMsg=%+v", applyMsg)
+		if kv.applyIndex > int64(applyMsg.CommandIndex) {
+			panic(fmt.Sprintf("can`t install snapshot while kv.applyIndex=%v > applyMsg.CommandIndex=%v", kv.applyIndex, applyMsg.CommandIndex))
+		}
+		kv.applyIndex = int64(applyMsg.CommandIndex)
+		bytes, ok := applyMsg.Command.([]byte)
+		if !ok {
+			panic("command type mismatched")
+		}
+		kv.installSnapshot(bytes)
+		// 清除过期context
+		for idx, ctx := range kv.idx2Context {
+			if idx <= applyMsg.CommandIndex {
+				kv.DPrint("find a context=%+v out of date in index=%v", ctx, idx)
+				ctx.respCh <- &OpResp{
+					Type:     ctx.req.Type,
+					ClientID: ctx.req.ClientID,
+					SeqID:    ctx.req.SeqID,
+					Err:      ErrTimeout,
+					Value:    "",
+				}
+				kv.DPrint("delete watcher>>, index=%v", idx)
+				delete(kv.idx2Context, idx)
+			}
+		}
+	}
+}
+
+func (kv *KVServer) onGetSnap() *raft.GetSnapResp {
+	resp := &raft.GetSnapResp{
+		Index: kv.applyIndex,
+		Data:  nil,
+	}
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.id2LatestResp)
+	e.Encode(kv.store)
+	resp.Data = w.Bytes()
+	return resp
+}
+
+func (kv *KVServer) installSnapshot(data []byte) {
+	if data == nil || len(data) < 1 {
+		panic("data is empty while installing snapshot")
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&kv.id2LatestResp) != nil || d.Decode(&kv.store) != nil {
+		panic("decode failed while installing snapshot")
 	}
 }
 
@@ -325,15 +380,20 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := &KVServer{
 		mu:            deadlock.Mutex{},
 		me:            me,
-		rf:            raft.Make(servers, me, persister, applyCh),
+		rf:            nil, // set later
 		applyCh:       applyCh,
 		closeCh:       make(chan struct{}),
-		maxraftstate:  maxraftstate,
+		maxraftstate:  int64(maxraftstate),
+		getSnapCh:     nil, // set later
 		store:         make(map[string]string),
 		applyIndex:    0,
 		idx2Context:   make(map[int]*serverContext),
 		id2LatestResp: make(map[int64]OpResp),
 	}
+	if maxraftstate > 0 {
+		kv.getSnapCh = make(chan raft.GetSnapReq)
+	}
+	kv.rf = raft.Make(servers, me, persister, applyCh, int64(maxraftstate), kv.getSnapCh)
 
 	// You may need initialization code here.
 	go kv.eventLoop()

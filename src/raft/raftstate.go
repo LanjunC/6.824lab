@@ -41,7 +41,16 @@ const (
 	MsgBroadcast
 	MsgBroadcastResp
 	MsgPropose
+	MsgSnapShot
 )
+
+type persistState struct {
+	CurrentTerm int64
+	VotedFor    int64
+	Entries     []Entry
+	// todo: 相比paper可新增如下字段方便快速恢复
+	//e.Encode(rf.state.logs.commitIndex)
+}
 
 type Message struct {
 	MsgType      messageType
@@ -58,6 +67,7 @@ type Message struct {
 	XTerm      int64
 	XLen       int64
 	MatchIndex int64 // for follower to response leader`s appendentries rpc 帮助leader更新matchIndex
+	SnapShot   *SnapShot
 }
 
 type RaftState struct {
@@ -112,6 +122,8 @@ func (rs *RaftState) stepLeader(m *Message) {
 		rs.handleBroadcastResp(m)
 	case MsgPropose:
 		rs.handleAppendEntry(m)
+	case MsgSnapShot: // todo:check
+		rs.handleSnapShot(m)
 	}
 }
 func (rs *RaftState) stepCandidate(m *Message) {
@@ -125,7 +137,8 @@ func (rs *RaftState) stepCandidate(m *Message) {
 	case MsgBroadcast:
 		rs.handleBroadcast(m)
 	case MsgBroadcastResp:
-
+	case MsgSnapShot: // todo:check
+		rs.handleSnapShot(m)
 	}
 }
 
@@ -139,7 +152,8 @@ func (rs *RaftState) stepFollower(m *Message) {
 	case MsgBroadcast:
 		rs.handleBroadcast(m)
 	case MsgBroadcastResp:
-
+	case MsgSnapShot: // todo:check
+		rs.handleSnapShot(m)
 	}
 }
 
@@ -188,8 +202,12 @@ func (rs *RaftState) handleRequestVote(m *Message) {
 	// RequestVote rule 2: 如果 votedFor 为空或者为 candidateId，并且candidate的日志至少和自己一样新，那么就投票
 	// 1.如果两份日志最后 entry 的 term 号不同，则 term 号大的日志更新
 	// 2.如果两份日志最后 entry 的 term 号相同，则比较长的日志更新
-	theLast := rs.getLastLog()
-	candidateIsNew := m.LogTerm > theLast.Term || m.LogTerm == theLast.Term && m.LogIndex >= theLast.Index
+	theLastIndex := rs.logs.getLastIndex()
+	theLastTerm, err := rs.logs.getTerm(theLastIndex)
+	if err != nil {
+		panic("unexpected")
+	}
+	candidateIsNew := m.LogTerm > theLastTerm || m.LogTerm == theLastTerm && m.LogIndex >= theLastIndex
 	if (rs.votedFor == -1 || rs.votedFor == m.From) && candidateIsNew {
 		rs.logPrint("Request vote: agree to vote for [%v].", m.From)
 		rs.votedFor = m.From
@@ -267,12 +285,22 @@ func (rs *RaftState) handleBroadcast(m *Message) {
 	}
 	// AppendEntries rule 2: 该peer上找不到prevLogIndex和prevLogTerm匹配的日志则返回false（日志一致性检测）
 	// 优化：paper第七页末
-	if rs.getLastLog().Index < m.LogIndex || rs.logs.entries[m.LogIndex].Term != m.LogTerm {
+	theLastIndex := rs.logs.getLastIndex()
+	//preLogTerm, err := rs.logs.getTerm(m.LogIndex)
+	//if err != nil {
+	//	panic("unexpected")
+	//}
+	if preLogTerm, _ := rs.logs.getTerm(m.LogIndex); theLastIndex < m.LogIndex || preLogTerm != m.LogTerm { // ignore provisionally
 		rs.logPrint("Receive broadcast(heartbeat or appendEntries): refuse it because no log matches Index=%v and Term=%v", m.LogIndex, m.LogTerm)
-		conflictIndex := min(m.LogIndex, rs.getLastLog().Index)
-		xTerm := rs.logs.entries[conflictIndex].Term
+		conflictIndex := min(m.LogIndex, theLastIndex)
+		xTerm, _ := rs.logs.getTerm(conflictIndex)
 		for xIndex := conflictIndex; xIndex > 0; xIndex-- {
-			if rs.logs.entries[xIndex-1].Term != xTerm {
+			//if rs.logs.entries[xIndex-1].Term != xTerm {
+			//	resp.XIndex = xIndex
+			//	break
+			//}
+			// todo check
+			if term, err := rs.logs.getTerm(xIndex - 1); (err == nil) && term != xTerm {
 				resp.XIndex = xIndex
 				break
 			}
@@ -282,16 +310,38 @@ func (rs *RaftState) handleBroadcast(m *Message) {
 		resp.Accept = false
 		return
 	}
+
 	// AppendEntries rule 3 & 4: 一致性检测通过，追加日志（同时覆盖冲突日志）
 	// 需要注意由于网络延迟造成包无序所带来的影响
 	rs.logPrint("Receive broadcast(heartbeat or appendEntries): accept log entry. preLogIndex=%v, preLogTerm=%v", m.LogIndex, m.LogTerm)
+	conflictI := -1
+	conflictIndex := int64(-1)
 	for i, entry := range m.Entries {
-		if entry.Index > rs.getLastLog().Index || entry.Term != rs.logs.entries[entry.Index].Term {
-			rs.logs.entries = rs.logs.entries[:entry.Index]
-			rs.logs.entries = append(rs.logs.entries, m.Entries[i:]...) // todo: 封装
+		//term, err := rs.logs.getTerm(entry.Index)
+		//if err != nil {
+		//	rs.logPrint("DEBUG:%v", rs.logs.entries)
+		//	panic(fmt.Sprintf("get term failed, index=%v, err=[%v]", entry.Index, err.Error()))
+		//}
+		if term, _ := rs.logs.getTerm(entry.Index); entry.Index > theLastIndex || entry.Term != term { // ignore err provisionally
+			//rs.logs.entries = rs.logs.entries[:entry.Index]
+			//rs.logs.entries = append(rs.logs.entries, m.Entries[i:]...) // todo: 封装
+			//rs.logs.truncateLast(entry.Index)
+			//for _, e := range m.Entries[i:] {
+			//	rs.logs.appendLog(e)
+			//}
+			conflictI = i
+			conflictIndex = entry.Index
 			break
 		}
 	}
+	// find conflictEntry
+	if conflictI != -1 {
+		rs.logs.truncateLast(conflictIndex)
+		for _, e := range m.Entries[conflictI:] {
+			rs.logs.appendLog(e)
+		}
+	}
+
 	// 新增paper中没有的字段， 用于leader更新matchIndex
 	//resp.MatchIndex = rs.getLastLog().Index 是错误的，如新leader上任，但有比他日志更新的follower（index更大）
 	resp.MatchIndex = m.LogIndex + int64(len(m.Entries))
@@ -299,8 +349,8 @@ func (rs *RaftState) handleBroadcast(m *Message) {
 	old := rs.logs.commitIndex
 	if m.LeaderCommit > rs.logs.commitIndex {
 		// 取min(LeaderCommit,刚追加的新日志的最大Index)
-		rs.logs.commitIndex = min(m.LeaderCommit, rs.getLastLog().Index)
-		rs.logPrint("Receive broadcast(heartbeat or appendEntries): update commitIndex from %v to %v and start rf.apply()", old, rs.logs.commitIndex)
+		rs.logs.commitIndex = min(m.LeaderCommit, rs.logs.getLastIndex()) // why?
+		rs.logPrint("Receive broadcast(heartbeat or appendEntries): update commitIndex from %v to %v", old, rs.logs.commitIndex)
 		//rf.apply()
 	}
 	resp.Accept = true
@@ -326,6 +376,8 @@ func (rs *RaftState) handleBroadcastResp(m *Message) {
 		rs.nextIndex[m.From] = max(rs.nextIndex[m.From], next)
 		rs.leaderCommit()
 	} else {
+		// todo check
+		old := rs.nextIndex[m.From]
 		rs.logPrint("Receive broadcast(heartbeat or appendEntries) resp: [%v] reply refuse.", m.From)
 		lastLogIndexInXTerm := rs.findLastLogInXTerm(m.XTerm)
 		if lastLogIndexInXTerm > 0 {
@@ -337,7 +389,7 @@ func (rs *RaftState) handleBroadcastResp(m *Message) {
 			rs.nextIndex[m.From] = m.XLen
 		}
 		nIdx := rs.nextIndex[m.From]
-		rs.logPrint("Receive broadcast(heartbeat or appendEntries) resp: [%v]`s nextIndex sub from %v to %v", m.From, nIdx+1, nIdx)
+		rs.logPrint("Receive broadcast(heartbeat or appendEntries) resp: [%v]`s nextIndex sub from %v to %v", m.From, old, nIdx)
 		// todo: 日志不一致立刻重发，而不是等待下一次 rpc
 	}
 }
@@ -351,8 +403,73 @@ func (rs *RaftState) handleAppendEntry(m *Message) {
 	if entry.Term != rs.currentTerm {
 		panic("entry.Term != rs.currentTerm")
 	}
-	rs.appendLog(entry)
+	rs.logPrint("handleAppendEntry: append entry and broadcast")
+	rs.logs.appendLog(entry)
+	if rs.peersCount == 1 {
+		rs.logPrint("handleAppendEntry: only one peer, call leaderCommit directly.")
+		rs.leaderCommit()
+	}
 	rs.broadcast()
+}
+
+func (rs *RaftState) handleSnapShot(m *Message) {
+	resp := Message{
+		MsgType:    MsgBroadcastResp,
+		From:       m.To,
+		To:         m.From,
+		Term:       rs.currentTerm,
+		MatchIndex: -1, // todo: set later
+		Accept:     false,
+	}
+	defer func(resp *Message) {
+		rs.msgs = append(rs.msgs, *resp)
+	}(&resp)
+
+	rs.logPrint("Receive installSnapshot, message=%+v", m)
+	// Like AppendEntries rule 1: leader的term小于接收者的当前term, 返回false
+	if m.Term < rs.currentTerm {
+		rs.logPrint("Receive installSnapshot: refuse it because [%v]`s term [%v] is less.", m.From, m.Term)
+		resp.Accept = false
+		return
+	}
+	// append snapshot rpc同样可以当心跳包用
+	rs.electionElapsed = 0
+	// candidate rule 3: 接收到了合法leader的append snapshot rpc，回到follower
+	if rs.stateType == StateCandidate {
+		rs.logPrint("Receive installSnapshot: received valid installSnapshot rpc, so update to follower.")
+		rs.becomeFollower(m.Term)
+	}
+	// all server rule 2: leader的term大于接收者的currentTerm, 需更新currentTerm，状态变更为follower
+	if rs.currentTerm < m.Term {
+		rs.logPrint("Receive installSnapshot: term is less than [%v]`s term[%v], so update to follower.", m.From, m.Term)
+		rs.becomeFollower(m.Term)
+	}
+
+	// 这种情况[有可能?]发生，如使用了优化算法使得leader在减peer.next时快速倒退
+	if rs.logs.commitIndex >= m.SnapShot.Index {
+		rs.logPrint("Receive installSnapshot: leader go back too match...")
+		resp.MatchIndex = rs.logs.commitIndex
+		resp.Accept = true
+		return
+	}
+	// save snapshot file
+	if rs.logs.pendingSnapShot == nil || rs.logs.pendingSnapShot.Index < m.SnapShot.Index {
+		rs.logPrint("Receive installSnapshot: save snapshot file.")
+		rs.logs.pendingSnapShot = m.SnapShot
+	}
+	if term, err := rs.logs.getTerm(m.SnapShot.Index); err == nil && term == m.SnapShot.Term {
+		rs.logPrint("Receive installSnapshot: exists entry has same index and term as snapshot’s last included entry.")
+		rs.logs.commitIndex = term
+		resp.MatchIndex = term
+		resp.Accept = true
+		return
+	} else {
+		rs.logPrint("Receive installSnapshot: discard log entries")
+		rs.logs.resetWithSnapShot(rs.logs.pendingSnapShot)
+		resp.MatchIndex = rs.logs.getLastIndex()
+		resp.Accept = true
+		return
+	}
 }
 
 func (rs *RaftState) becomeCandidate() {
@@ -381,7 +498,7 @@ func (rs *RaftState) becomeFollower(term int64) {
 func (rs *RaftState) becomeLeader() {
 	rs.stateType = StateLeader
 	rs.heartbeatElapsed = 0
-	nextIndex := rs.getLastLog().Index + 1
+	nextIndex := rs.logs.getLastIndex() + 1
 	for peer := 0; peer < rs.peersCount; peer++ {
 		rs.nextIndex[peer] = nextIndex
 		rs.matchIndex[peer] = 0
@@ -398,19 +515,21 @@ func (rs *RaftState) campaign() {
 		if peer == rs.me {
 			continue
 		}
+		theLastIndex := rs.logs.getLastIndex()
+		theLastTerm, _ := rs.logs.getTerm(theLastIndex)
 		msg := Message{
 			MsgType:  MsgRequestVote,
 			From:     int64(rs.me),
 			To:       int64(peer),
 			Term:     rs.currentTerm,
-			LogIndex: rs.getLastLog().Index,
-			LogTerm:  rs.getLastLog().Term,
+			LogIndex: theLastIndex,
+			LogTerm:  theLastTerm,
 		}
 		rs.msgs = append(rs.msgs, msg)
 	}
 }
 
-// for leader: heartbeat or appendEntries
+// for leader: heartbeat or appendEntries or installSnapshot
 func (rs *RaftState) broadcast() {
 	for peer := 0; peer < rs.peersCount; peer++ {
 		if peer == rs.me {
@@ -420,15 +539,32 @@ func (rs *RaftState) broadcast() {
 		if nextIndex < 1 { //nextIndex的实际意义需合理
 			nextIndex = 1
 		}
-		entries := make([]Entry, rs.getLastLog().Index-nextIndex+1)
-		copy(entries, rs.logs.entries[nextIndex:])
+		if nextIndex <= rs.logs.preLogIndex {
+			// 节点落后，发送 installSnapshot rpc 而不是 append entries rpc
+			rs.logPrint("find [%v]`s log is behindhand(nextIndex=%v <= logs.preLogIndex=%v), "+
+				"try to append snapshot file", peer, nextIndex, rs.logs.preLogIndex)
+			msg := Message{
+				MsgType:  MsgSnapShot,
+				From:     int64(rs.me),
+				To:       int64(peer),
+				Term:     rs.currentTerm,
+				SnapShot: nil, // set while sending rpc
+			}
+			rs.msgs = append(rs.msgs, msg)
+			continue
+		}
+		rs.logPrint("try to append entries/send heartbeat to [%v]...", peer)
+		entries := make([]Entry, rs.logs.getLastIndex()-nextIndex+1)
+		//copy(entries, rs.logs.entries[nextIndex:])
+		copy(entries, rs.logs.getEntriesFrom(nextIndex))
+		preLogTerm, _ := rs.logs.getTerm(nextIndex - 1)
 		msg := Message{
 			MsgType:      MsgBroadcast,
 			From:         int64(rs.me),
 			To:           int64(peer),
 			Term:         rs.currentTerm,
-			LogIndex:     rs.logs.entries[nextIndex-1].Index,
-			LogTerm:      rs.logs.entries[nextIndex-1].Term,
+			LogIndex:     nextIndex - 1,
+			LogTerm:      preLogTerm,
 			Entries:      entries,
 			LeaderCommit: rs.logs.commitIndex,
 		}
@@ -451,10 +587,10 @@ func (rs *RaftState) findLastLogInXTerm(xterm int64) int64 {
 
 func (rs *RaftState) leaderCommit() {
 	N := rs.logs.commitIndex
-	for n := rs.logs.commitIndex + 1; n <= rs.getLastLog().Index; n++ {
+	for n := rs.logs.commitIndex + 1; n <= rs.logs.getLastIndex(); n++ {
 		// figure 8: 不提交非当前任期的日志
 		// p.s. 一旦当前任期的日志被提交，那么由于日志匹配特性，之前的日志条目也都会被间接的提交
-		if rs.logs.entries[n].Term != rs.currentTerm {
+		if term, _ := rs.logs.getTerm(n); term != rs.currentTerm {
 			continue
 		}
 		count := 1
@@ -472,11 +608,11 @@ func (rs *RaftState) leaderCommit() {
 		rs.logPrint("No log to commit. Skip it.")
 		return
 	}
-	rs.logPrint("leaderCommit: update commitIndex from %v to %v and start rf.apply()", rs.logs.commitIndex, N)
+	rs.logPrint("leaderCommit: update commitIndex from %v to %v", rs.logs.commitIndex, N)
 	rs.logs.commitIndex = N
 }
 
-func newRaftState(me int, peersCount int, stateType stateType) *RaftState {
+func newRaftState(me int, peersCount int, stateType stateType, persistState *persistState, snap *SnapShot) *RaftState {
 	rs := &RaftState{
 		stateType:        stateType,
 		me:               me,
@@ -484,7 +620,7 @@ func newRaftState(me int, peersCount int, stateType stateType) *RaftState {
 		currentTerm:      0,
 		votedFor:         -1,
 		votes:            make([]bool, peersCount),
-		logs:             NewLogs(),
+		logs:             NewLogs(persistState, snap),
 		nextIndex:        make([]int64, peersCount),
 		matchIndex:       make([]int64, peersCount),
 		electionTimeout:  -1, // reset later
@@ -493,6 +629,12 @@ func newRaftState(me int, peersCount int, stateType stateType) *RaftState {
 		msgs:             make([]Message, 0),
 	}
 	rs.resetTimeout()
+	// read persist state
+	if persistState != nil {
+		rs.currentTerm = persistState.CurrentTerm
+		rs.votedFor = persistState.VotedFor
+		rs.logs.entries = persistState.Entries
+	}
 	return rs
 }
 

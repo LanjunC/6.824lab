@@ -79,7 +79,7 @@ func (ck *Clerk) eventLoop() {
 					fallthrough
 				case ErrClosed:
 					fallthrough
-				case ErrReAppearingIndices:
+				case ErrTimeout:
 					ck.changeLeaderID(string(resp.Err))
 				default:
 					panic(fmt.Sprintf("invalid resp err=%s", resp.Err))
