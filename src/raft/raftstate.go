@@ -286,11 +286,15 @@ func (rs *RaftState) handleBroadcast(m *Message) {
 	// AppendEntries rule 2: 该peer上找不到prevLogIndex和prevLogTerm匹配的日志则返回false（日志一致性检测）
 	// 优化：paper第七页末
 	theLastIndex := rs.logs.getLastIndex()
-	//preLogTerm, err := rs.logs.getTerm(m.LogIndex)
-	//if err != nil {
-	//	panic("unexpected")
-	//}
-	if preLogTerm, _ := rs.logs.getTerm(m.LogIndex); theLastIndex < m.LogIndex || preLogTerm != m.LogTerm { // ignore provisionally
+	mayPreLogTerm, err := rs.logs.getTerm(m.LogIndex)
+	// leader 早期的日志到达，但follower已经非常新，m.prelogindex对应的日志已经被压缩掉了
+	// 其他的err则是follower日志太短，在后面的逻辑会resp.Accpet = false
+	if err != nil && err == errCompacted {
+		resp.MatchIndex = rs.logs.commitIndex // 已经commit的一定能够和leader匹配，所以
+		resp.Accept = true
+		return
+	}
+	if theLastIndex < m.LogIndex || mayPreLogTerm != m.LogTerm {
 		rs.logPrint("Receive broadcast(heartbeat or appendEntries): refuse it because no log matches Index=%v and Term=%v", m.LogIndex, m.LogTerm)
 		conflictIndex := min(m.LogIndex, theLastIndex)
 		xTerm, _ := rs.logs.getTerm(conflictIndex)
@@ -306,7 +310,8 @@ func (rs *RaftState) handleBroadcast(m *Message) {
 			}
 		}
 		resp.XTerm = xTerm
-		resp.XLen = int64(len(rs.logs.entries))
+		//resp.XLen = int64(len(rs.logs.entries))
+		resp.XLen = rs.logs.getLastIndex() + 1 // check
 		resp.Accept = false
 		return
 	}
@@ -322,7 +327,11 @@ func (rs *RaftState) handleBroadcast(m *Message) {
 		//	rs.logPrint("DEBUG:%v", rs.logs.entries)
 		//	panic(fmt.Sprintf("get term failed, index=%v, err=[%v]", entry.Index, err.Error()))
 		//}
-		if term, _ := rs.logs.getTerm(entry.Index); entry.Index > theLastIndex || entry.Term != term { // ignore err provisionally
+		mayConflictTerm, err := rs.logs.getTerm(entry.Index)
+		if err != nil && err == errCompacted {
+			panic("unexpected here(compacted log case has been handled before)")
+		}
+		if entry.Index > theLastIndex || entry.Term != mayConflictTerm { // ignore err provisionally
 			//rs.logs.entries = rs.logs.entries[:entry.Index]
 			//rs.logs.entries = append(rs.logs.entries, m.Entries[i:]...) // todo: 封装
 			//rs.logs.truncateLast(entry.Index)
@@ -409,7 +418,7 @@ func (rs *RaftState) handleAppendEntry(m *Message) {
 		rs.logPrint("handleAppendEntry: only one peer, call leaderCommit directly.")
 		rs.leaderCommit()
 	}
-	rs.broadcast()
+	rs.broadcast() // todo: 并发量大的情况下是否有必要？因为此时start速度远大于日志同步速度，会发送很多重复的appendEntries rpc
 }
 
 func (rs *RaftState) handleSnapShot(m *Message) {
@@ -458,9 +467,22 @@ func (rs *RaftState) handleSnapShot(m *Message) {
 		rs.logs.pendingSnapShot = m.SnapShot
 	}
 	if term, err := rs.logs.getTerm(m.SnapShot.Index); err == nil && term == m.SnapShot.Term {
-		rs.logPrint("Receive installSnapshot: exists entry has same index and term as snapshot’s last included entry.")
-		rs.logs.commitIndex = term
-		resp.MatchIndex = term
+		rs.logPrint("Receive installSnapshot: exists entry has same index=%v and term=%v as snapshot’s last included entry.", m.SnapShot.Index, term)
+		//
+		// 有两个地方会生成snapshot,都在handleRaftReady中
+		// 首先是pendingSnapShot != nil时
+		// 其次是阈值检测，日志压缩
+		// 因此这里检测到term, err := rs.logs.getTerm(m.SnapShot.Index); err == nil && term == m.SnapShot.Term时，
+		// 就可认为此时日志并没有落后于leader，至少能跟上leader快照的最后一条，
+		// 因此将压缩的任务交给阈值检测时，避免在handleRaftReady中两次执行生成snapshot操作引起不必要的混乱
+		// 可以尝试把这段if注释掉测试TestSnapshotRecoverManyClients3B查看bug
+		// some bad case here...
+		if rs.logs.pendingSnapShot == m.SnapShot {
+			rs.logPrint("Receive installSnapshot: the most recent snapshot, it can? be ignored.")
+			rs.logs.pendingSnapShot = nil
+		}
+		rs.logs.commitIndex = m.SnapShot.Index
+		resp.MatchIndex = m.SnapShot.Index
 		resp.Accept = true
 		return
 	} else {
@@ -640,7 +662,7 @@ func newRaftState(me int, peersCount int, stateType stateType, persistState *per
 
 // 非并发安全debug输出
 func (rs *RaftState) logPrint(format string, args ...interface{}) {
-	if false {
+	if true {
 		return
 	}
 	s := fmt.Sprintf(format, args...)

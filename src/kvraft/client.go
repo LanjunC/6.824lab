@@ -9,7 +9,7 @@ import "crypto/rand"
 import "math/big"
 
 const (
-	opTimeout = 500 * time.Millisecond // 每次操作超时事件
+	opTimeout = 300 * time.Millisecond // 每次操作超时事件
 )
 
 type Clerk struct {
@@ -72,7 +72,6 @@ func (ck *Clerk) eventLoop() {
 					fallthrough
 				case ErrNoKey:
 					opCtx.respCh <- resp
-					fmt.Println(fmt.Sprintf("client get resp=%+v, leader=%v", resp, ck.lastLeaderID))
 					ck.curSeqID++
 					break LOOP
 				case ErrWrongLeader:
@@ -91,7 +90,7 @@ func (ck *Clerk) eventLoop() {
 }
 
 func (ck *Clerk) changeLeaderID(reason string) {
-	fmt.Printf("changer old leader=%v, because of %v\n", ck.lastLeaderID, reason)
+	//fmt.Printf("change old leader=%v, because of %v\n", ck.lastLeaderID, reason)
 	ck.lastLeaderID = (ck.lastLeaderID + 1) % len(ck.servers)
 }
 

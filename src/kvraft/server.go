@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const Debug = 1
+const Debug = 0
 
 func (kv *KVServer) DPrint(format string, a ...interface{}) (n int, err error) {
 	if Debug <= 0 {
@@ -223,6 +223,8 @@ func (kv *KVServer) onApply(applyMsg raft.ApplyMsg) {
 			panic(fmt.Sprintf("applyMsg.CommandIndex=%v <= kv.applyIndex=%v", applyMsg.CommandIndex, kv.applyIndex))
 			// todo 崩溃的raft回来后appliedIndex和commitIdex都为0... check??
 		}
+		kv.DPrint("onApply: update kv.applyIndex=%v -> applyMsg.CommandIndex=%v", kv.applyIndex, applyMsg.CommandIndex)
+		kv.applyIndex = int64(applyMsg.CommandIndex)
 		req, ok := applyMsg.Command.(OpReq)
 		if !ok {
 			panic("command mismatches OpReq type")
@@ -291,7 +293,13 @@ func (kv *KVServer) onApply(applyMsg raft.ApplyMsg) {
 
 		kv.DPrint("onApply: final resp=%+v, update latest resp", resp)
 		kv.id2LatestResp[req.ClientID] = *resp
-		kv.applyIndex = int64(applyMsg.CommandIndex)
+		//
+		// applyMsg about snapshot BEFORE RETURN.
+		// [bad case] 两个一模一样的请求，都被start()后均会被计入日志，但不会被都执行，因为在执行前就被return了
+		// 因此return前就需要更新server.applyIndex
+		//
+		//kv.DPrint("onApply: update kv.applyIndex=%v -> applyMsg.CommandIndex=%v", kv.applyIndex, applyMsg.CommandIndex)
+		//kv.applyIndex = int64(applyMsg.CommandIndex)
 		if existCtx {
 			ctx.respCh <- resp
 			kv.DPrint("delete watcher$$, index=%v", applyMsg.CommandIndex)
@@ -299,7 +307,7 @@ func (kv *KVServer) onApply(applyMsg raft.ApplyMsg) {
 		}
 	} else {
 		// applyMsg about snapshot
-		kv.DPrint("receive applyMsg about snapshot, applyMsg=%+v", applyMsg)
+		kv.DPrint("onApply: receive applyMsg about snapshot, CommandIndex=%v, CommandTerm=%v", applyMsg.CommandIndex, applyMsg.CommandTerm)
 		if kv.applyIndex > int64(applyMsg.CommandIndex) {
 			panic(fmt.Sprintf("can`t install snapshot while kv.applyIndex=%v > applyMsg.CommandIndex=%v", kv.applyIndex, applyMsg.CommandIndex))
 		}
@@ -328,6 +336,8 @@ func (kv *KVServer) onApply(applyMsg raft.ApplyMsg) {
 }
 
 func (kv *KVServer) onGetSnap() *raft.GetSnapResp {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 	resp := &raft.GetSnapResp{
 		Index: kv.applyIndex,
 		Data:  nil,
@@ -374,7 +384,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	applyCh := make(chan raft.ApplyMsg)
 
 	// DEBUG
-	deadlock.Opts.DeadlockTimeout = time.Second // 获取锁超时控制
+	deadlock.Opts.DeadlockTimeout = 5 * time.Second // 获取锁超时控制
 	//deadlock.Opts.Disable = true
 
 	kv := &KVServer{
@@ -393,9 +403,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	if maxraftstate > 0 {
 		kv.getSnapCh = make(chan raft.GetSnapReq)
 	}
+
+	// must before raft.Make([bad case] my applyMsg send during raft making, so kv.eventLoop first to wait applyMsg)
+	go kv.eventLoop()
+
 	kv.rf = raft.Make(servers, me, persister, applyCh, int64(maxraftstate), kv.getSnapCh)
 
-	// You may need initialization code here.
-	go kv.eventLoop()
 	return kv
 }

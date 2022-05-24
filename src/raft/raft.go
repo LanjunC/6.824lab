@@ -431,7 +431,7 @@ func (rf *Raft) handleRaftReady() {
 	}
 	pendingSnapShot := rf.state.logs.pendingSnapShot
 	if pendingSnapShot != nil {
-		rf.persistStateAndSnap(pState, pendingSnapShot)
+		rf.state.logPrint("handleRaftReady: pendingSnapShot!=nil, pendingSnapShot.Index=%v", pendingSnapShot.Index)
 		rf.applyCh <- ApplyMsg{
 			CommandValid: false,
 			Command:      pendingSnapShot.SnapData,
@@ -441,14 +441,18 @@ func (rf *Raft) handleRaftReady() {
 		if rf.state.logs.lastApplied > pendingSnapShot.Index {
 			panic("unexpected, lastApplied can not go back")
 		}
+		rf.persistStateAndSnap(pState, pendingSnapShot)
 		rf.state.logs.lastApplied = pendingSnapShot.Index
+		//rf.state.logs.compactLog() // todo check
 		rf.state.logs.pendingSnapShot = nil
+
 	} else {
 		rf.persistState(pState)
 	}
 
 	// 检测，若日志大小达到阈值，获取snapshot，压缩日志
 	if rf.maxraftstate > 0 && int64(rf.persister.RaftStateSize()) >= rf.maxraftstate {
+		rf.state.logPrint("handleRaftReady: The log size reaches the threshold.")
 		getSnapRespCh := make(chan GetSnapResp)
 		getSnapReq := GetSnapReq{RespCh: getSnapRespCh}
 		rf.getSnapCh <- getSnapReq
@@ -463,6 +467,7 @@ func (rf *Raft) handleRaftReady() {
 			panic(fmt.Sprintf("can not get term, index=%v, err=%v", appliedIndex, err))
 		}
 		rf.state.logs.compactLog(appliedIndex)
+		rf.state.logPrint("handleRaftReady: after log compact, the logs.preLogIndex=%v.", rf.state.logs.preLogIndex)
 		snap := &SnapShot{
 			Index:    appliedIndex,
 			Term:     term,
@@ -556,9 +561,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	persistState, snap := rf.readPersistState(persister.ReadRaftState()), rf.readPersistSnap(persister.ReadSnapshot())
-	fmt.Printf("Make raft DEBUG:persistState=%+v, snap=%+v\n", persistState, snap)
+	fmt.Printf("Make raft DEBUG:persistState=%+v\n", persistState)
 	// if it has snapshot
 	if snap != nil {
+		fmt.Printf("Make raft DEBUG: snap.Index=%v\n", snap.Index)
 		msg := ApplyMsg{
 			CommandValid: false,
 			Command:      snap.SnapData,

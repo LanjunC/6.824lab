@@ -58,6 +58,7 @@ func (l *Logs) getTerm(index int64) (int64, error) {
 	if index == l.preLogIndex {
 		return l.preLogTerm, nil
 	}
+	// 其实和下面的是同一种err，只是len=0需要特殊处理一下
 	if len(l.entries) == 0 {
 		return 0, errInvalidIndex
 	}
@@ -124,6 +125,7 @@ func NewLogs(persistState *persistState, snap *SnapShot) *Logs {
 		logs.preLogIndex = snap.Index
 		logs.preLogTerm = snap.Term
 		logs.lastApplied = snap.Index
+		logs.commitIndex = snap.Index
 		if len(logs.entries) > 0 && logs.preLogIndex+1 != logs.entries[0].Index {
 			panic("unexpected")
 		}
